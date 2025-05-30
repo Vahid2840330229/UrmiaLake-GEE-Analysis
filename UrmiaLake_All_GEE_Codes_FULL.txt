@@ -1,0 +1,168 @@
+
+// NDWI extraction from Landsat 5, 7, and 8
+var lakeUrmia = ee.FeatureCollection('projects/ee-vahidisazade75/assets/urmia');
+
+function processL57(img) {
+  var toa = img.multiply(0.0000275).add(-0.2);
+  var ndwi = toa.normalizedDifference(['SR_B2', 'SR_B4']).rename('NDWI');
+  return ndwi.set('system:time_start', img.get('system:time_start'));
+}
+
+function processL8(img) {
+  var toa = img.multiply(0.0000275).add(-0.2);
+  var ndwi = toa.normalizedDifference(['SR_B3', 'SR_B5']).rename('NDWI');
+  return ndwi.set('system:time_start', img.get('system:time_start'));
+}
+
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterBounds(lakeUrmia).filterDate('2000-01-01', '2011-12-31')
+  .map(processL57);
+
+var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+  .filterBounds(lakeUrmia).filterDate('2000-01-01', '2020-12-31')
+  .map(processL57);
+
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(lakeUrmia).filterDate('2013-01-01', '2024-12-31')
+  .map(processL8);
+
+var ndwiCollection = l5.merge(l7).merge(l8);
+var years = ee.List.sequence(2000, 2024);
+
+function getAnnualNDWI(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return ndwiCollection.filterDate(start, end)
+    .median().clip(lakeUrmia)
+    .select('NDWI').set('year', year);
+}
+
+years.getInfo().forEach(function(year) {
+  var image = getAnnualNDWI(year);
+  Export.image.toDrive({
+    image: image,
+    description: 'NDWI_Urmia_' + year,
+    folder: 'Urmia_NDWI_Exports',
+    fileNamePrefix: 'NDWI_Urmia_' + year,
+    region: lakeUrmia.geometry(),
+    scale: 30, crs: 'EPSG:4326', maxPixels: 1e13
+  });
+});
+
+
+
+// NDVI computation for Landsat 5, 7, 8
+var lakeUrmia = ee.Geometry.Rectangle([44.5, 36.5, 46.5, 38.5]);
+
+function addNDVI(image, sensor) {
+  var ndvi = ee.Image(0);
+  if (sensor === 'L5' || sensor === 'L7') {
+    ndvi = image.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI');
+  } else if (sensor === 'L8') {
+    ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  }
+  return image.addBands(ndvi).copyProperties(image, ['system:time_start']);
+}
+
+var landsat5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterDate('2000-01-01', '2011-12-31').filterBounds(lakeUrmia)
+  .map(function(image) { return addNDVI(image, 'L5'); });
+
+var landsat7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+  .filterDate('2000-01-01', '2020-12-31').filterBounds(lakeUrmia)
+  .map(function(image) { return addNDVI(image, 'L7'); });
+
+var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterDate('2013-01-01', '2024-01-01').filterBounds(lakeUrmia)
+  .map(function(image) { return addNDVI(image, 'L8'); });
+
+var allLandsat = landsat5.merge(landsat7).merge(landsat8);
+
+var years = ee.List.sequence(2000, 2024);
+var annualNDVI = ee.ImageCollection.fromImages(years.map(function(y) {
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end = start.advance(1, 'year');
+  return allLandsat.filterDate(start, end).select('NDVI').mean().set('year', y);
+}));
+
+
+
+// AOD extraction and monthly mean calculation
+var urmia = ee.Geometry.Rectangle([44.5, 36.5, 46.5, 38.5]);
+
+var collection = ee.ImageCollection("MODIS/061/MCD19A2_GRANULES")
+  .filterDate("2000-01-01", "2024-12-31")
+  .filterBounds(urmia).select("Optical_Depth_055");
+
+var months = ee.List.sequence(2000, 2024).map(function(y) {
+  return ee.List.sequence(1, 12).map(function(m) {
+    return ee.Date.fromYMD(y, m, 1);
+  });
+}).flatten();
+
+var features = months.map(function(date) {
+  var monthly = collection.filterDate(date, ee.Date(date).advance(1, 'month')).mean();
+  var stats = monthly.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: urmia, scale: 1000, maxPixels: 1e9, bestEffort: true
+  });
+  return ee.Algorithms.If(stats.contains("Optical_Depth_055"),
+    ee.Feature(null, {
+      'date': ee.Date(date).format('YYYY-MM'),
+      'AOD': stats.get("Optical_Depth_055")
+    }), null);
+});
+
+var filtered = ee.FeatureCollection(features).filter(ee.Filter.notNull(['AOD']));
+
+Export.table.toDrive({
+  collection: filtered,
+  description: 'Urmia_AOD_2000_2024',
+  fileFormat: 'CSV'
+});
+
+
+
+// GRACE water storage extraction for Urmia Basin
+var urmiaBasin = ee.FeatureCollection("projects/ee-vahidisazade75/assets/vahid");
+
+function extractMeanLWE(collection, bandName, label) {
+  return collection.map(function(image) {
+    var mean = image.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: urmiaBasin.geometry(),
+      scale: 100000, maxPixels: 1e13
+    });
+    return ee.Feature(null, {
+      'date': image.date().format('YYYY-MM-dd'),
+      'meanLWE': mean.get(bandName),
+      'source': label
+    });
+  });
+}
+
+var grace = ee.ImageCollection("NASA/GRACE/MASS_GRIDS/LAND")
+  .filterBounds(urmiaBasin).filterDate('2002-04-01', '2024-12-31');
+
+var jpl = extractMeanLWE(grace.select('lwe_thickness_jpl'), 'lwe_thickness_jpl', 'JPL');
+var csr = extractMeanLWE(grace.select('lwe_thickness_csr'), 'lwe_thickness_csr', 'CSR');
+var gfz = extractMeanLWE(grace.select('lwe_thickness_gfz'), 'lwe_thickness_gfz', 'GFZ');
+
+var allData = jpl.merge(csr).merge(gfz);
+
+
+
+// Dust source frequency mapping based on AOD > threshold
+var urmia = ee.Geometry.Rectangle([44.5, 36.5, 46.5, 38.5]);
+var aodCollection = ee.ImageCollection("MODIS/061/MCD19A2_GRANULES")
+  .filterBounds(urmia)
+  .filterDate('2000-01-01', '2024-12-31')
+  .select('Optical_Depth_055');
+
+var threshold = 0.35;
+var dustyEvents = aodCollection.map(function(img) {
+  return img.gt(threshold).selfMask().set('system:time_start', img.get('system:time_start'));
+});
+
+var dustFrequency = dustyEvents.sum();
+Map.addLayer(dustFrequency, {min: 0, max: 100, palette: ['white', 'orange', 'red']}, 'Dust Frequency');
